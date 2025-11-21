@@ -3,7 +3,10 @@ use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row, SqlitePool, error::DatabaseError, sqlite::SqliteError};
+use std::collections::HashSet;
+use std::fs;
 
+use crate::data::normalize;
 pub struct Database {
     pool: SqlitePool,
 }
@@ -1125,7 +1128,155 @@ impl Database {
             }
         };
 
-        Ok(vec![])
+        let symbol_str = raw_result.unwrap_or_default();
+        let mut symbols: Vec<String> = Vec::new();
+
+        if symbol_str.is_empty() {
+            let default_json = self
+                .get_system_config("default_coins")
+                .await
+                .unwrap_or_default();
+
+            if let Ok(parsed) = serde_json::from_str::<Vec<String>>(&default_json) {
+                symbols = parsed;
+            } else {
+                log::warn!("⚠️ 解析 default_coins 配置失败 or empty，使用硬编码默认值");
+                symbols = vec![
+                    "BTCUSDT".to_string(),
+                    "ETHUSDT".to_string(),
+                    "SOLUSDT".to_string(),
+                    "BNBUSDT".to_string(),
+                ];
+            }
+
+            return Ok(symbols);
+        }
+
+        let mut seen = HashSet::new();
+        for s in symbol_str.split(",") {
+            if s.trim().is_empty() {
+                continue;
+            }
+
+            let coin = normalize(s);
+            if seen.insert(coin.clone()) {
+                symbols.push(coin);
+            }
+        }
+
+        Ok(symbols)
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        Ok(self.pool.close().await)
+    }
+
+    pub async fn load_beta_codes_from_file(
+        &self,
+        file_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let content =
+            fs::read_to_string(file_path).map_err(|e| format!("读取内测码文件失败: {}", e))?;
+
+        let codes: Vec<&str> = content
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+
+        let total_codes = codes.len();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("开始事务失败: {}", e))?;
+
+        let mut inserted_count = 0;
+        for code in codes {
+            let result = sqlx::query("INSERT OR IGNORE INTO beta_codes (code) VALUES (?)")
+                .bind(code)
+                .execute(&mut *tx) // Execute inside the transaction
+                .await;
+
+            match result {
+                Ok(res) => {
+                    if res.rows_affected() > 0 {
+                        inserted_count += 1;
+                    }
+                }
+                Err(e) => {
+                    // Log error but continue processing other codes
+                    log::error!("插入内测码 {} 失败: {:?}", code, e);
+                }
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("提交事务失败: {}", e))?;
+
+        log::info!(
+            "✅ 成功加载 {} 个内测码到数据库 (总计 {} 个)",
+            inserted_count,
+            total_codes
+        );
+
+        Ok(())
+    }
+
+    pub async fn validate_beta_code(&self, code: &str) -> Result<bool> {
+        let result = sqlx::query("SELECT used FROM beta_codes WHERE code = ?")
+            .bind(code)
+            .execute(&self.pool)
+            .await;
+
+        match result {
+            Ok(res) => {
+                if res.rows_affected() > 0 {
+                    return Ok(true);
+                }
+            }
+            Err(_) => return Ok(false),
+        }
+
+        Ok(false)
+    }
+
+    pub async fn user_beta_code(
+        &self,
+        code: &str,
+        user_email: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let result = sqlx::query(
+            r#"
+            UPDATE beta_codes SET used = 1, used_by = ?, used_at = CURRENT_TIMESTAMP 
+		    WHERE code = ? AND used = 0
+        "#,
+        )
+        .bind(user_email)
+        .bind(code)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err("内测码无效或已被使用".into());
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_beta_code_stats(&self) -> Result<(i64, i64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM beta_codes")
+            .fetch_one(&self.pool)
+            .await?;
+
+        // 2. Get Used count
+        let used: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM beta_codes WHERE used = 1")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok((total, used))
     }
 }
 

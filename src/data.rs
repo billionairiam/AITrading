@@ -402,7 +402,7 @@ fn format_float_slice(values: &[f64]) -> String {
 }
 
 /// Normalizes a symbol to its uppercase USDT pair format.
-fn normalize(symbol: &str) -> String {
+pub fn normalize(symbol: &str) -> String {
     let upper = symbol.to_uppercase();
     if upper.ends_with("USDT") {
         upper
